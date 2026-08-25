@@ -206,6 +206,3 @@ ecom-microservices/
 
 ---
 
-## License
-
-MIT

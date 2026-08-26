@@ -138,12 +138,6 @@ docker compose up -d
 
 ## API Reference
 
-### Auth — get a token from Keycloak
-
-```bash
-curl -X POST http://localhost:8443/realms/ecom-app/protocol/openid-connect/token \
-  -d "client_id=ecom-client&grant_type=password&username=john&password=john123"
-```
 
 ### Product Service
 

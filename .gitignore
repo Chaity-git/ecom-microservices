@@ -20,3 +20,13 @@ build/
 # OS-specific
 .DS_Store
 Thumbs.db
+
+# IDE
+.idea/
+*.iml
+*.iws
+.vscode/
+
+# Build output
+target/
+**/target/

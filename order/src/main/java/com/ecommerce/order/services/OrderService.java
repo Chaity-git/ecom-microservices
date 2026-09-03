@@ -1,111 +1,76 @@
 package com.ecommerce.order.services;
 
 import com.ecommerce.order.dtos.OrderCreatedEvent;
-import com.ecommerce.order.repositories.OrderRepository;
-import com.ecommerce.order.models.OrderStatus;
 import com.ecommerce.order.dtos.OrderItemDTO;
 import com.ecommerce.order.dtos.OrderResponse;
 import com.ecommerce.order.models.CartItem;
 import com.ecommerce.order.models.Order;
 import com.ecommerce.order.models.OrderItem;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.cloud.stream.function.StreamBridge;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
 import java.util.List;
-import java.util.Map;
 import java.util.Optional;
-import java.util.stream.Collectors;
 
 @Service
+@Slf4j
 @RequiredArgsConstructor
 public class OrderService {
+
+    private static final String ORDER_CREATED_BINDING = "createOrder-out-0";
+
     private final CartService cartService;
-    private final OrderRepository orderRepository;
+    private final OrderPersistenceService orderPersistenceService;
     private final StreamBridge streamBridge;
 
     public Optional<OrderResponse> createOrder(String userId) {
-        // Validate for cart items
         List<CartItem> cartItems = cartService.getCart(userId);
-        if (cartItems.isEmpty()) {
+
+        // Save the order and clear the cart atomically.
+        Optional<Order> saved = orderPersistenceService.placeOrder(userId, cartItems);
+        if (saved.isEmpty()) {
             return Optional.empty();
         }
-//        // Validate for user
-//
-//        Optional<User> userOptional = userRepository.findById(Long.valueOf(userId));
-//        if (userOptional.isEmpty()) {
-//            return Optional.empty();
-//        }
-//        User user = userOptional.get();
+        Order order = saved.get();
 
-        // Calculate total price
-        BigDecimal totalPrice = cartItems.stream()
-                .map(CartItem::getPrice)
-                .reduce(BigDecimal.ZERO, BigDecimal::add);
+        // Published only after the transaction has committed, so no database
+        // connection is held while the broker responds.
+        //
+        // Known limitation: the commit and the publish are not atomic. If this
+        // process dies in between, the order exists with no event. The proper fix
+        // is the transactional outbox pattern — write the event to an outbox table
+        // inside the transaction above and let a poller publish it.
+        publishOrderCreated(order);
 
-        // Create order
-        Order order = new Order();
-        order.setUserId(userId);
-        order.setStatus(OrderStatus.CONFIRMED);
-        order.setTotalAmount(totalPrice);
+        return Optional.of(mapToOrderResponse(order));
+    }
 
-        List<OrderItem> orderItems = cartItems.stream()
-                .map(item -> new OrderItem(
-                        null,
-                        item.getProductId(),
-                        item.getQuantity(),
-                        item.getPrice(),
-                        order
-                ))
-                .toList();
-
-        order.setItems(orderItems);
-        Order savedOrder = orderRepository.save(order);
-
-        // Clear the cart
-        cartService.clearCart(userId);
-
-        // Publish order created event
+    private void publishOrderCreated(Order order) {
         OrderCreatedEvent event = new OrderCreatedEvent(
-          savedOrder.getId(),
-          savedOrder.getUserId(),
-          savedOrder.getStatus(),
-          mapToOrderItemDTOs(savedOrder.getItems()),
-          savedOrder.getTotalAmount(),
-          savedOrder.getCreatedAt()
-        );
-        streamBridge.send("createOrder-out-0", event);
-
-        return Optional.of(mapToOrderResponse(savedOrder));
+                order.getId(), order.getUserId(), order.getStatus(),
+                mapToOrderItemDTOs(order.getItems()),
+                order.getTotalAmount(), order.getCreatedAt());
+        try {
+            streamBridge.send(ORDER_CREATED_BINDING, event);
+        } catch (Exception e) {
+            log.error("Order {} committed but the OrderCreatedEvent could not be published",
+                    order.getId(), e);
+        }
     }
 
     private List<OrderItemDTO> mapToOrderItemDTOs(List<OrderItem> items) {
         return items.stream()
-                .map(item -> new OrderItemDTO(
-                        item.getId(),
-                        item.getProductId(),
-                        item.getQuantity(),
-                        item.getPrice(),
-                        item.getPrice().multiply(new BigDecimal(item.getQuantity()))
-                )).collect(Collectors.toList());
+                .map(item -> new OrderItemDTO(item.getId(), item.getProductId(),
+                        item.getQuantity(), item.getPrice(),
+                        item.getPrice().multiply(BigDecimal.valueOf(item.getQuantity()))))
+                .toList();
     }
 
     private OrderResponse mapToOrderResponse(Order order) {
-        return new OrderResponse(
-                order.getId(),
-                order.getTotalAmount(),
-                order.getStatus(),
-                order.getItems().stream()
-                        .map(orderItem -> new OrderItemDTO(
-                                orderItem.getId(),
-                                orderItem.getProductId(),
-                                orderItem.getQuantity(),
-                                orderItem.getPrice(),
-                                orderItem.getPrice().multiply(new BigDecimal(orderItem.getQuantity()))
-                        ))
-                        .toList(),
-                order.getCreatedAt()
-        );
+        return new OrderResponse(order.getId(), order.getTotalAmount(), order.getStatus(),
+                mapToOrderItemDTOs(order.getItems()), order.getCreatedAt());
     }
 }

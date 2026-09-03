@@ -7,20 +7,36 @@ import org.springframework.cloud.gateway.route.builder.RouteLocatorBuilder;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.http.HttpMethod;
+import org.springframework.security.core.context.ReactiveSecurityContextHolder;
 import reactor.core.publisher.Mono;
+
+import java.time.Duration;
 
 @Configuration
 public class GatewayConfig {
 
+    /** replenishRate=10/s, burstCapacity=20, 1 token per request. Redis-backed so the
+     *  limit is global across gateway replicas rather than per-instance. */
     @Bean
     public RedisRateLimiter redisRateLimiter() {
-        return new RedisRateLimiter(10,20,1);
+        return new RedisRateLimiter(10, 20, 1);
     }
 
+    /**
+     * Rate-limit per authenticated user, not per remote address.
+     *
+     * Keying on the remote address collapses every user behind a load balancer or
+     * ingress into a single bucket, so one busy client throttles everybody. The JWT
+     * subject is stable and genuinely per-user. Unauthenticated traffic falls back
+     * to the remote address.
+     */
     @Bean
-    public KeyResolver hostNameKeyResolver() {
-        return exchange -> Mono.just(
-                exchange.getRequest().getRemoteAddress().getHostName());
+    public KeyResolver userKeyResolver() {
+        return exchange -> ReactiveSecurityContextHolder.getContext()
+                .map(ctx -> ctx.getAuthentication().getName())
+                .defaultIfEmpty(exchange.getRequest().getRemoteAddress() == null
+                        ? "anonymous"
+                        : exchange.getRequest().getRemoteAddress().getAddress().getHostAddress());
     }
 
     @Bean
@@ -28,36 +44,32 @@ public class GatewayConfig {
         return builder.routes()
                 .route("product-service", r -> r
                         .path("/api/products/**")
-                        .filters(f -> f.retry(retryConfig -> retryConfig
-                                        .setRetries(10)
+                        .filters(f -> f
+                                // 3 attempts with exponential backoff, GET only.
+                                // Was 10 retries: with the breaker needing 5 calls to
+                                // open, a struggling service was hit 11x per request
+                                // before the breaker had enough samples to trip.
+                                .retry(retry -> retry
+                                        .setRetries(2)
                                         .setMethods(HttpMethod.GET)
-                                )
+                                        .setBackoff(Duration.ofMillis(100),
+                                                    Duration.ofSeconds(2), 2, true))
                                 .requestRateLimiter(config -> config
                                         .setRateLimiter(redisRateLimiter())
-                                        .setKeyResolver(hostNameKeyResolver()))
+                                        .setKeyResolver(userKeyResolver()))
                                 .circuitBreaker(config -> config
-                                .setName("ecomBreaker")
-                                .setFallbackUri("forward:/fallback/products")))
-//                        .filters(f -> f.rewritePath("/products(?<segment>/?.*)",
-//                                "/api/products${segment}"))
+                                        .setName("ecomBreaker")
+                                        .setFallbackUri("forward:/fallback/products")))
                         .uri("lb://PRODUCT-SERVICE"))
                 .route("user-service", r -> r
                         .path("/api/users/**")
-//                        .filters(f -> f.rewritePath("/users(?<segment>/?.*)",
-//                                "/api/users${segment}"))
                         .uri("lb://USER-SERVICE"))
                 .route("order-service", r -> r
                         .path("/api/orders/**", "/api/cart/**")
-//                        .filters(f -> f.rewritePath("/(?<segment>.*)",
-//                                "/api/${segment}"))
                         .uri("lb://ORDER-SERVICE"))
-                .route("eureka-server", r -> r
-                        .path("/eureka/main")
-                        .filters(f -> f.rewritePath("/eureka/main", "/"))
-                        .uri("http://localhost:8761"))
-                .route("eureka-server-static", r -> r
-                        .path("/eureka/**")
-                        .uri("http://localhost:8761"))
                 .build();
+        // The eureka-server routes were removed: they hardcoded http://localhost:8761,
+        // which breaks as soon as the gateway runs in a container. Reach the Eureka
+        // dashboard directly on :8761 instead of proxying it.
     }
 }

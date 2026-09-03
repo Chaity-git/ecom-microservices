@@ -2,75 +2,75 @@ package com.ecommerce.order.services;
 
 import com.ecommerce.order.clients.ProductServiceClient;
 import com.ecommerce.order.clients.UserServiceClient;
+import com.ecommerce.order.dtos.CartItemRequest;
 import com.ecommerce.order.dtos.ProductResponse;
 import com.ecommerce.order.dtos.UserResponse;
-import com.ecommerce.order.repositories.CartItemRepository;
-import com.ecommerce.order.dtos.CartItemRequest;
 import com.ecommerce.order.models.CartItem;
+import com.ecommerce.order.repositories.CartItemRepository;
 import io.github.resilience4j.circuitbreaker.annotation.CircuitBreaker;
 import io.github.resilience4j.retry.annotation.Retry;
-import jakarta.transaction.Transactional;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
-import java.math.BigDecimal;
 import java.util.List;
 
+/**
+ * Orchestrates the cart. Remote calls happen here, outside any transaction;
+ * persistence is delegated to CartPersistenceService.
+ */
 @Service
+@Slf4j
 @RequiredArgsConstructor
-@Transactional
 public class CartService {
+
     private final CartItemRepository cartItemRepository;
+    private final CartPersistenceService cartPersistenceService;
     private final ProductServiceClient productServiceClient;
     private final UserServiceClient userServiceClient;
-    int attempt = 0;
 
-//    @CircuitBreaker(name = "productService", fallbackMethod = "addToCartFallBack")
-@Retry(name = "retryBreaker", fallbackMethod = "addToCartFallBack")
+    /**
+     * Circuit breaker first, then retry: the breaker sheds load once product-service
+     * is consistently failing, so retries never pile onto an already-failing service.
+     */
+    @CircuitBreaker(name = "productService", fallbackMethod = "addToCartFallback")
+    @Retry(name = "retryBreaker", fallbackMethod = "addToCartFallback")
     public boolean addToCart(String userId, CartItemRequest request) {
-        System.out.println("ATTEMPT COUNT: " + ++attempt);
-        // Look for product
-        ProductResponse productResponse = productServiceClient.getProductDetails(request.getProductId());
-        if (productResponse == null || productResponse.getStockQuantity() < request.getQuantity())
+        ProductResponse product = productServiceClient.getProductDetails(request.getProductId());
+        if (product == null) {
+            log.warn("Product {} not found while adding to cart for user {}",
+                    request.getProductId(), userId);
             return false;
-
-        UserResponse userResponse = userServiceClient.getUserDetails(userId);
-        if (userResponse == null)
-            return false;
-
-        CartItem existingCartItem = cartItemRepository.findByUserIdAndProductId(userId, request.getProductId());
-        if (existingCartItem != null) {
-            // Update the quantity
-            existingCartItem.setQuantity(existingCartItem.getQuantity() + request.getQuantity());
-            existingCartItem.setPrice(BigDecimal.valueOf(1000.00));
-            cartItemRepository.save(existingCartItem);
-        } else {
-            // Create new cart item
-           CartItem cartItem = new CartItem();
-           cartItem.setUserId(userId);
-           cartItem.setProductId(request.getProductId());
-           cartItem.setQuantity(request.getQuantity());
-           cartItem.setPrice(BigDecimal.valueOf(1000.00));
-           cartItemRepository.save(cartItem);
         }
+        if (product.getStockQuantity() == null || product.getStockQuantity() < request.getQuantity()) {
+            log.info("Insufficient stock for product {}: requested {}, available {}",
+                    request.getProductId(), request.getQuantity(), product.getStockQuantity());
+            return false;
+        }
+
+        UserResponse user = userServiceClient.getUserDetails(userId);
+        if (user == null) {
+            log.warn("Unknown user {} while adding to cart", userId);
+            return false;
+        }
+
+        // The real catalogue price. This was previously hardcoded to 1000.00, so
+        // every cart line totalled 1000 regardless of the product.
+        cartPersistenceService.upsertCartItem(
+                userId, request.getProductId(), request.getQuantity(), product.getPrice());
+
         return true;
     }
 
-    public boolean addToCartFallBack(String userId,
-                                     CartItemRequest request,
-                                     Exception exception) {
-        exception.printStackTrace();
+    @SuppressWarnings("unused")   // invoked by Resilience4j
+    public boolean addToCartFallback(String userId, CartItemRequest request, Throwable t) {
+        log.error("addToCart fallback for user {} / product {}: {}",
+                userId, request.getProductId(), t.toString());
         return false;
     }
 
     public boolean deleteItemFromCart(String userId, String productId) {
-        CartItem cartItem = cartItemRepository.findByUserIdAndProductId(userId, productId);
-
-        if (cartItem != null){
-            cartItemRepository.delete(cartItem);
-            return true;
-        }
-        return false;
+        return cartPersistenceService.deleteItem(userId, productId);
     }
 
     public List<CartItem> getCart(String userId) {
@@ -78,6 +78,6 @@ public class CartService {
     }
 
     public void clearCart(String userId) {
-        cartItemRepository.deleteByUserId(userId);
+        cartPersistenceService.clear(userId);
     }
 }
